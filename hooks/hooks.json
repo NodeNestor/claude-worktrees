@@ -1,0 +1,6 @@
+{
+  "description": "Worktrees — parallel experiment orchestrator",
+  "hooks": {
+    "SessionStart": [{"hooks": [{"type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/run_hook.sh\" session_start.py", "timeout": 10}]}]
+  }
+}
