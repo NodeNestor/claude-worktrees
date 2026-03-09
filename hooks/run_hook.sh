@@ -6,4 +6,4 @@ if [ -f "$PLUGIN_ROOT/venv/bin/activate" ]; then
 elif [ -f "$PLUGIN_ROOT/venv/Scripts/activate" ]; then
     source "$PLUGIN_ROOT/venv/Scripts/activate"
 fi
-python "$SCRIPT_DIR/$1" 2>/dev/null
+python3 "$SCRIPT_DIR/$1" 2>/dev/null
