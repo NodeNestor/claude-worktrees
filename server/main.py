@@ -19,57 +19,54 @@ from experiment_state import (
     list_experiments as state_list,
 )
 
-server = MCPServer("claude-worktrees", "1.0.0")
+server = MCPServer("claude-worktrees", "2.0.0")
 
 
 def _gen_id(description: str) -> str:
-    """Generate a short experiment ID from description + timestamp."""
     h = hashlib.sha256(f"{description}{time.time()}".encode()).hexdigest()[:8]
     return h
+
+
+def _project_path() -> str:
+    """Get project path from environment or cwd."""
+    return os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
 
 
 # --- Tools ---
 
 @server.tool(
-    "start_experiment",
-    "Create N parallel worktrees to try different approaches to a problem. "
-    "Returns experiment ID and worktree paths. Use run_variant to get prompts for each.",
+    "experiment_start",
+    "Create N parallel git worktrees to try different approaches to a problem. "
+    "Each worktree gets its own branch. After working on variants, use experiment_eval to compare them.",
     {
         "properties": {
-            "project_path": {"type": "string", "description": "Absolute path to the git project root"},
             "description": {"type": "string", "description": "What this experiment is trying to solve"},
-            "num_variants": {"type": "integer", "description": "Number of parallel approaches to try (2-10)"},
+            "num_variants": {"type": "integer", "description": "Number of parallel approaches (2-5)"},
             "eval_cmd": {"type": "string", "description": "Command to evaluate each variant (e.g. 'npm test', 'python -m pytest')"},
             "variant_hints": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Optional hints for each variant, e.g. ['use redis caching', 'use in-memory LRU', 'use disk cache']",
+                "description": "Approach hint for each variant, e.g. ['use redis', 'use LRU cache', 'use SQLite']",
             },
         },
-        "required": ["project_path", "description", "num_variants", "eval_cmd"],
+        "required": ["description", "num_variants", "eval_cmd"],
     },
 )
-def start_experiment(
-    project_path: str,
+def experiment_start(
     description: str,
     num_variants: int,
     eval_cmd: str,
     variant_hints: list[str] | None = None,
 ):
-    num_variants = max(2, min(10, num_variants))
+    project_path = _project_path()
+    num_variants = max(2, min(5, num_variants))
     experiment_id = _gen_id(description)
     mgr = WorktreeManager(project_path)
 
-    # Create worktrees
     result = mgr.create_experiment(experiment_id, num_variants)
     if result["errors"]:
-        return {
-            "success": False,
-            "experiment_id": experiment_id,
-            "errors": result["errors"],
-        }
+        return {"success": False, "experiment_id": experiment_id, "errors": result["errors"]}
 
-    # Save state
     state_create(
         project_path=project_path,
         experiment_id=experiment_id,
@@ -80,16 +77,13 @@ def start_experiment(
         variant_hints=variant_hints,
     )
 
-    # Build response
-    variants_info = []
+    variants = []
     for v in result["variants"]:
-        hint = None
-        if variant_hints and v["id"] <= len(variant_hints):
-            hint = variant_hints[v["id"] - 1]
-        variants_info.append({
+        hint = variant_hints[v["id"] - 1] if variant_hints and v["id"] <= len(variant_hints) else None
+        variants.append({
             "variant": v["id"],
             "branch": v["branch"],
-            "path": v["path"],
+            "worktree_path": v["path"],
             "hint": hint,
         })
 
@@ -99,105 +93,23 @@ def start_experiment(
         "description": description,
         "base_branch": result["base_branch"],
         "eval_cmd": eval_cmd,
-        "variants": variants_info,
-        "next_step": f"Use run_variant to get a working prompt for each variant. "
-                     f"Work on each variant by editing files in its worktree path.",
+        "variants": variants,
     }
 
 
 @server.tool(
-    "experiment_status",
-    "Show the current status of an experiment and all its variants.",
+    "experiment_eval",
+    "Run the eval command in each variant's worktree and rank results. "
+    "Shows which variants passed, their timing, and recommends the winner.",
     {
         "properties": {
-            "project_path": {"type": "string", "description": "Absolute path to the git project root"},
             "experiment_id": {"type": "string", "description": "Experiment ID"},
         },
-        "required": ["project_path", "experiment_id"],
+        "required": ["experiment_id"],
     },
 )
-def experiment_status(project_path: str, experiment_id: str):
-    exp = get_experiment(project_path, experiment_id)
-    if not exp:
-        return {"error": f"Experiment {experiment_id} not found"}
-    return exp
-
-
-@server.tool(
-    "run_variant",
-    "Get the worktree path and a formatted prompt for working on a specific variant. "
-    "Use this to know WHERE to make changes and WHAT approach to take.",
-    {
-        "properties": {
-            "project_path": {"type": "string", "description": "Absolute path to the git project root"},
-            "experiment_id": {"type": "string", "description": "Experiment ID"},
-            "variant": {"type": "integer", "description": "Variant number (1-based)"},
-            "prompt": {"type": "string", "description": "The task prompt — what to implement in this variant"},
-        },
-        "required": ["project_path", "experiment_id", "variant", "prompt"],
-    },
-)
-def run_variant(project_path: str, experiment_id: str, variant: int, prompt: str):
-    exp = get_experiment(project_path, experiment_id)
-    if not exp:
-        return {"error": f"Experiment {experiment_id} not found"}
-
-    variant_info = None
-    for v in exp["variants"]:
-        if v["id"] == variant:
-            variant_info = v
-            break
-    if not variant_info:
-        return {"error": f"Variant {variant} not found"}
-
-    mgr = WorktreeManager(project_path)
-    worktree_path = mgr.get_worktree_path(experiment_id, variant)
-
-    if not os.path.isdir(worktree_path):
-        return {"error": f"Worktree path does not exist: {worktree_path}"}
-
-    # Update variant status
-    update_variant(project_path, experiment_id, variant, {"status": "in_progress"})
-
-    hint_text = ""
-    if variant_info.get("hint"):
-        hint_text = f"\n\nAPPROACH HINT: {variant_info['hint']}"
-
-    formatted_prompt = (
-        f"## Experiment: {exp['description']}\n"
-        f"## Variant {variant} of {exp['num_variants']}\n"
-        f"## Working directory: {worktree_path}\n"
-        f"## Branch: {variant_info['branch']}\n"
-        f"{hint_text}\n\n"
-        f"IMPORTANT: All file edits for this variant MUST be in:\n"
-        f"  {worktree_path}\n\n"
-        f"TASK:\n{prompt}\n\n"
-        f"When done, the variant will be evaluated with:\n"
-        f"  {exp['eval_cmd']}"
-    )
-
-    return {
-        "worktree_path": worktree_path,
-        "branch": variant_info["branch"],
-        "variant": variant,
-        "hint": variant_info.get("hint"),
-        "prompt": formatted_prompt,
-    }
-
-
-@server.tool(
-    "evaluate_variants",
-    "Run the eval command in each variant's worktree and compare results. "
-    "Returns a ranked comparison showing which variants passed and their timing.",
-    {
-        "properties": {
-            "project_path": {"type": "string", "description": "Absolute path to the git project root"},
-            "experiment_id": {"type": "string", "description": "Experiment ID"},
-        },
-        "required": ["project_path", "experiment_id"],
-    },
-)
-def evaluate_variants(project_path: str, experiment_id: str):
+def experiment_eval(experiment_id: str):
+    project_path = _project_path()
     exp = get_experiment(project_path, experiment_id)
     if not exp:
         return {"error": f"Experiment {experiment_id} not found"}
@@ -207,7 +119,6 @@ def evaluate_variants(project_path: str, experiment_id: str):
     mgr = WorktreeManager(project_path)
     results = mgr.evaluate_all(experiment_id, exp["eval_cmd"])
 
-    # Update variant states
     for r in results:
         status = "passed" if r.get("success") else "failed"
         update_variant(project_path, experiment_id, r["variant"], {
@@ -223,71 +134,62 @@ def evaluate_variants(project_path: str, experiment_id: str):
 
     update_experiment(project_path, experiment_id, {"status": "evaluated"})
 
-    # Build comparison
     passed = [r for r in results if r.get("success")]
     failed = [r for r in results if not r.get("success")]
 
     return {
         "experiment_id": experiment_id,
         "eval_cmd": exp["eval_cmd"],
-        "total_variants": len(results),
+        "total": len(results),
         "passed": len(passed),
         "failed": len(failed),
         "results": results,
         "recommendation": (
             f"Variant {passed[0]['variant']} is the fastest passing variant "
-            f"({passed[0]['duration_seconds']}s). Use merge_variant to merge it."
-            if passed else "No variants passed. Review the errors and try again."
+            f"({passed[0]['duration_seconds']}s). Use experiment_merge to merge it."
+            if passed else "No variants passed. Review errors and fix or retry."
         ),
     }
 
 
 @server.tool(
-    "get_variant_diff",
-    "Show the git diff for a specific variant compared to the base branch.",
+    "experiment_diff",
+    "Show the git diff for a variant compared to the base branch.",
     {
         "properties": {
-            "project_path": {"type": "string", "description": "Absolute path to the git project root"},
             "experiment_id": {"type": "string", "description": "Experiment ID"},
             "variant": {"type": "integer", "description": "Variant number"},
         },
-        "required": ["project_path", "experiment_id", "variant"],
+        "required": ["experiment_id", "variant"],
     },
 )
-def get_variant_diff(project_path: str, experiment_id: str, variant: int):
+def experiment_diff(experiment_id: str, variant: int):
+    project_path = _project_path()
     mgr = WorktreeManager(project_path)
     diff = mgr.get_variant_diff(experiment_id, variant)
-    return {
-        "experiment_id": experiment_id,
-        "variant": variant,
-        "diff": diff,
-    }
+    return {"experiment_id": experiment_id, "variant": variant, "diff": diff}
 
 
 @server.tool(
-    "merge_variant",
-    "Merge the winning variant into the base branch and clean up all other worktrees/branches.",
+    "experiment_merge",
+    "Merge the winning variant into the base branch and clean up all worktrees.",
     {
         "properties": {
-            "project_path": {"type": "string", "description": "Absolute path to the git project root"},
             "experiment_id": {"type": "string", "description": "Experiment ID"},
             "variant": {"type": "integer", "description": "Variant number to merge"},
         },
-        "required": ["project_path", "experiment_id", "variant"],
+        "required": ["experiment_id", "variant"],
     },
 )
-def merge_variant(project_path: str, experiment_id: str, variant: int):
+def experiment_merge(experiment_id: str, variant: int):
+    project_path = _project_path()
     mgr = WorktreeManager(project_path)
 
-    # Merge the winner
     merge_result = mgr.merge_variant(experiment_id, variant)
     if not merge_result.get("success"):
         return merge_result
 
-    # Clean up all worktrees and branches
     cleanup_result = mgr.cleanup_experiment(experiment_id)
-
-    # Update state
     update_experiment(project_path, experiment_id, {"status": "merged"})
 
     return {
@@ -299,38 +201,33 @@ def merge_variant(project_path: str, experiment_id: str, variant: int):
 
 
 @server.tool(
-    "cleanup_experiment",
-    "Remove all worktrees and branches for an experiment without merging anything.",
+    "experiment_cleanup",
+    "Remove all worktrees and branches for an experiment without merging.",
     {
         "properties": {
-            "project_path": {"type": "string", "description": "Absolute path to the git project root"},
             "experiment_id": {"type": "string", "description": "Experiment ID"},
         },
-        "required": ["project_path", "experiment_id"],
+        "required": ["experiment_id"],
     },
 )
-def cleanup_experiment(project_path: str, experiment_id: str):
+def experiment_cleanup(experiment_id: str):
+    project_path = _project_path()
     mgr = WorktreeManager(project_path)
     result = mgr.cleanup_experiment(experiment_id)
     delete_experiment(project_path, experiment_id)
-    return {
-        "success": True,
-        "experiment_id": experiment_id,
-        **result,
-    }
+    return {"success": True, "experiment_id": experiment_id, **result}
 
 
 @server.tool(
-    "list_experiments",
-    "List all experiments in a project with their current status.",
+    "experiment_list",
+    "List all experiments in the current project with status.",
     {
-        "properties": {
-            "project_path": {"type": "string", "description": "Absolute path to the git project root"},
-        },
-        "required": ["project_path"],
+        "properties": {},
+        "required": [],
     },
 )
-def list_experiments(project_path: str):
+def experiment_list():
+    project_path = _project_path()
     experiments = state_list(project_path)
     if not experiments:
         return {"experiments": [], "message": "No active experiments."}
@@ -348,10 +245,27 @@ def list_experiments(project_path: str):
             "passed": passed,
             "failed": failed,
             "pending": pending,
-            "created": exp["created"],
         })
 
     return {"experiments": summary}
+
+
+@server.tool(
+    "experiment_status",
+    "Show detailed status of an experiment and all its variants.",
+    {
+        "properties": {
+            "experiment_id": {"type": "string", "description": "Experiment ID"},
+        },
+        "required": ["experiment_id"],
+    },
+)
+def experiment_status(experiment_id: str):
+    project_path = _project_path()
+    exp = get_experiment(project_path, experiment_id)
+    if not exp:
+        return {"error": f"Experiment {experiment_id} not found"}
+    return exp
 
 
 if __name__ == "__main__":

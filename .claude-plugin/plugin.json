@@ -1,7 +1,7 @@
 {
   "name": "claude-worktrees",
-  "version": "1.0.0",
-  "description": "Parallel experiment orchestrator — try N approaches in isolated git worktrees, evaluate each, merge the winner.",
+  "version": "2.0.0",
+  "description": "Parallel experiment orchestrator — try N approaches in isolated git worktrees, evaluate each, merge the winner. Use /experiment to start.",
   "author": { "name": "NodeNestor" },
   "homepage": "https://github.com/NodeNestor/claude-worktrees"
 }
